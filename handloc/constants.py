@@ -26,6 +26,10 @@ DEFAULT_POSE_MODEL = "yolo26x-pose"
 
 # "frontal": the camera faces the person, so the person's right side is on the image left.
 # "auto": decide the person's right side per frame from the shoulder keypoint order.
+# "frontal": camera facing the person (shoulder/hip grid). "side": camera at the person's side (body/knee grid).
+MODES = ["frontal", "side"]
+DEFAULT_MODE = "frontal"
+
 ORIENTATION_MODES = ["frontal", "auto"]
 DEFAULT_ORIENTATION = "frontal"
 
@@ -34,5 +38,5 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".wmv", ".webm"}
 BBOX_COLUMNS = ["x1", "y1", "x2", "y2"]
 KEYPOINT_COLUMNS = [f"{name}_{axis}" for name in KEYPOINT_NAMES for axis in ("x", "y", "conf")]
 POSE_COLUMNS = ["frame_idx", "track_id", "conf", *BBOX_COLUMNS, *KEYPOINT_COLUMNS]
-GRID_COLUMNS = ["grid_x_right", "grid_x_left", "grid_y_top", "grid_y_bottom", "hip_estimated"]
+FRAME_COLUMNS = ["frame_idx", "track_id", "hand", "x", "y"]
 SEGMENT_COLUMNS = ["track_id", "hand", "startTime", "endTime", "location"]

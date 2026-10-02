@@ -11,7 +11,7 @@ from .models import ModelManager
 from .progress import update_progress
 from .types import AppPaths, MediaContext
 
-POSE_CACHE_VERSION = 2
+POSE_CACHE_VERSION = 3
 
 
 class PoseTracker:
@@ -56,7 +56,6 @@ class PoseTracker:
 
         poses = pd.DataFrame(rows, columns=POSE_COLUMNS)
         poses.to_csv(context.poses_path, index=False)
-        self._write_meta(context, backend, det_thresh, tracker_config)
         return poses
 
     def load_cached(
@@ -66,14 +65,16 @@ class PoseTracker:
         det_thresh: float,
         tracker_config: dict[str, Any],
     ) -> pd.DataFrame | None:
-        if not context.poses_path.exists() or not context.poses_meta_path.exists():
+        """Reuse poses.csv when the "yolo" section of summary.json matches the current settings."""
+
+        if not context.poses_path.exists() or not context.summary_path.exists():
             return None
         try:
-            meta = json.loads(context.poses_meta_path.read_text(encoding="utf-8"))
+            recorded = json.loads(context.summary_path.read_text(encoding="utf-8")).get("yolo")
             cached = pd.read_csv(context.poses_path)
         except Exception:
             return None
-        if meta != self._meta(context, backend, det_thresh, tracker_config):
+        if recorded != self.meta(context, backend, det_thresh, tracker_config):
             return None
         if list(cached.columns) != POSE_COLUMNS:
             return None
@@ -111,7 +112,13 @@ class PoseTracker:
             return torch.device(device)
         return device
 
-    def _meta(self, context: MediaContext, backend: str, det_thresh: float, tracker_config: dict[str, Any]) -> dict[str, Any]:
+    def meta(self, context: MediaContext, backend: str, det_thresh: float, tracker_config: dict[str, Any]) -> dict[str, Any]:
+        """Everything poses.csv depends on; stored in summary.json["yolo"].
+
+        Settings applied after YOLO (person selection, mode, keypoint threshold, orientation) are deliberately
+        left out, so changing them reuses poses.csv instead of rerunning YOLO.
+        """
+
         media_path = Path(context.media_path).resolve()
         return {
             "cache_version": POSE_CACHE_VERSION,
@@ -122,7 +129,3 @@ class PoseTracker:
             "stride": int(context.person_stride),
             "tracker_config": tracker_config,
         }
-
-    def _write_meta(self, context: MediaContext, backend: str, det_thresh: float, tracker_config: dict[str, Any]) -> None:
-        meta = self._meta(context, backend, det_thresh, tracker_config)
-        context.poses_meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -29,11 +29,7 @@ class PipelineConfig:
     keypoint_conf_thresh: float
     person_target_fps: float
     tracker_updates: dict[str, Any]
-    smoothing_window: int
-    max_gap_seconds: float
-    min_track_seconds: float
-    min_segment_seconds: float
-    hip_ratio: float
+    mode: str
     orientation: str
     make_video: bool
     reuse_cached_poses: bool
@@ -46,9 +42,8 @@ class MediaContext:
     media_path: Path
     output_dir: Path
     poses_path: Path
-    poses_meta_path: Path
     frames_path: Path
-    segments_path: Path
+    locations_path: Path
     video_path: Path
     summary_path: Path
     fps: float

@@ -6,9 +6,11 @@ from pathlib import Path
 from typing import Any
 
 import cv2
+import numpy as np
 import pandas as pd
 
 from .annotate import FrameAnnotator
+from .constants import FRAME_COLUMNS, HANDS
 from .progress import update_progress
 from .types import AppPaths, MediaContext
 
@@ -21,14 +23,96 @@ class AnnotationExporter:
         self._available_ffmpeg_encoders: set[str] | None = None
 
     def write_frames_csv(self, frames: pd.DataFrame, context: MediaContext) -> Path:
-        frames.to_csv(context.frames_path, index=False, float_format="%.2f")
+        """Normalized wrist coordinates, one row per valid frame, track, and hand."""
+
+        tables = []
+        if not frames.empty:
+            for hand in HANDS:
+                valid = frames[frames[f"{hand}_valid"]]
+                tables.append(
+                    pd.DataFrame(
+                        {
+                            "frame_idx": valid["frame_idx"],
+                            "track_id": valid["track_id"],
+                            "hand": hand,
+                            "x": valid[f"{hand}_x_norm"],
+                            "y": valid[f"{hand}_y_norm"],
+                        }
+                    )
+                )
+        table = pd.concat(tables) if tables else pd.DataFrame(columns=FRAME_COLUMNS)
+        table = table.sort_values(["frame_idx", "track_id", "hand"], ascending=[True, True, False])
+        table.to_csv(context.frames_path, index=False, float_format="%.4f")
         return context.frames_path
 
-    def write_segments_csv(self, segments: pd.DataFrame, context: MediaContext) -> Path:
-        segments.to_csv(context.segments_path, index=False)
-        return context.segments_path
+    def write_locations_csv(self, segments: pd.DataFrame, context: MediaContext) -> Path:
+        segments.to_csv(context.locations_path, index=False)
+        return context.locations_path
 
-    def make_video(self, frames: pd.DataFrame, context: MediaContext, orientation: str, progress_bar=None) -> Path:
+    def make_heatmaps(self, frames: pd.DataFrame, context: MediaContext) -> dict[str, Path]:
+        """Wrist-position heatmaps over the whole video (right, left, both) on the middle frame.
+
+        Counts every valid frame of the target person, blurs the counts, and normalizes each image to its own
+        maximum. The person's grid is drawn faintly at its median position over the video, for reference.
+        """
+
+        capture = cv2.VideoCapture(str(context.media_path))
+        try:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, context.total_frames // 2)
+            ok, background = capture.read()
+        finally:
+            capture.release()
+        if not ok:
+            background = np.zeros((context.height, context.width, 3), np.uint8)
+        height, width = background.shape[:2]
+        sigma = 0.015 * max(width, height)
+
+        counts = {}
+        for hand in HANDS:
+            grid = np.zeros((height, width), np.float32)
+            if not frames.empty:
+                valid = frames[frames[f"{hand}_valid"]]
+                xs = np.clip(np.round(valid[f"{hand}_wrist_x"].to_numpy(dtype=float)), 0, width - 1).astype(int)
+                ys = np.clip(np.round(valid[f"{hand}_wrist_y"].to_numpy(dtype=float)), 0, height - 1).astype(int)
+                np.add.at(grid, (ys, xs), 1.0)
+            counts[hand] = grid
+        counts["both"] = counts["right"] + counts["left"]
+
+        reference = self._median_grids(background, frames)
+        paths = {}
+        for name, grid in [("right", counts["right"]), ("left", counts["left"]), ("both", counts["both"])]:
+            image = reference.copy()
+            total = int(grid.sum())
+            if total:
+                heat = cv2.GaussianBlur(grid, (0, 0), sigma)
+                heat /= heat.max()
+                colored = cv2.applyColorMap(np.uint8(heat * 255), cv2.COLORMAP_JET).astype(np.float32)
+                alpha = np.clip((heat - 0.02) / 0.98, 0, 1)[..., None] * 0.75  # faint areas stay transparent
+                image = (image * (1 - alpha) + colored * alpha).astype(np.uint8)
+            path = context.output_dir / f"heatmap_{name}.png"
+            cv2.imwrite(str(path), image)
+            paths[name] = path
+        return paths
+
+    def _median_grids(self, background: np.ndarray, frames: pd.DataFrame) -> np.ndarray:
+        if frames.empty:
+            return background.copy()
+        annotator = FrameAnnotator(background.shape[1], background.shape[0])
+        layer = background.copy()
+        columns = ["grid_x_first", "grid_x_second", "grid_y_top", "grid_y_bottom", "x1", "y1", "x2", "y2"]
+        for track_id, group in frames.groupby("track_id", sort=True):
+            usable = group[group["right_valid"] | group["left_valid"]]
+            if usable.empty:
+                continue
+            row = usable[columns].median().to_dict()
+            mirrored = annotator.mirrored(row)
+            edges = annotator._grid_edges(row)
+            color = annotator.id_to_color(track_id)
+            annotator._draw_grid(layer, edges, mirrored, color)
+            annotator._draw_track_id(layer, {"track_id": int(track_id)}, color, edges)
+        return cv2.addWeighted(layer, 0.5, background, 0.5, 0.0)
+
+    def make_video(self, frames: pd.DataFrame, context: MediaContext, progress_bar=None) -> Path:
         rows_by_frame: dict[int, list[dict[str, Any]]] = defaultdict(list)
         for row in frames.to_dict("records"):
             rows_by_frame[int(row["frame_idx"])].append(row)
@@ -36,16 +120,15 @@ class AnnotationExporter:
         encoder = self._preferred_h264_encoder()
         if encoder is not None:
             try:
-                return self._render(rows_by_frame, context, orientation, encoder, progress_bar)
+                return self._render(rows_by_frame, context, encoder, progress_bar)
             except RuntimeError as exc:
                 print(f"Video encoder {encoder} failed; falling back to libx264.\n{exc}", flush=True)
-        return self._render(rows_by_frame, context, orientation, "libx264", progress_bar)
+        return self._render(rows_by_frame, context, "libx264", progress_bar)
 
     def _render(
         self,
         rows_by_frame: dict[int, list[dict[str, Any]]],
         context: MediaContext,
-        orientation: str,
         encoder: str,
         progress_bar=None,
     ) -> Path:
@@ -101,9 +184,7 @@ class AnnotationExporter:
                     break
                 if frame.shape[1] != width or frame.shape[0] != height:
                     frame = cv2.resize(frame, (width, height))
-                for row in rows_by_frame.get(frame_idx, []):
-                    mirrored = orientation == "auto" and float(row["grid_x_right"]) > float(row["grid_x_left"])
-                    annotator.draw_person(frame, row, mirrored)
+                annotator.draw(frame, rows_by_frame.get(frame_idx, []))
                 try:
                     process.stdin.write(frame.tobytes())
                 except BrokenPipeError:

@@ -14,19 +14,35 @@ import streamlit as st
 
 from handloc import HandLocationAnalyzer
 from handloc.config import ConfigManager
-from handloc.constants import DEFAULT_ORIENTATION, DEFAULT_POSE_MODEL, HANDS, ORIENTATION_MODES, POSE_MODELS, VIDEO_EXTENSIONS
+from handloc.constants import DEFAULT_MODE, DEFAULT_ORIENTATION, DEFAULT_POSE_MODEL, HANDS, MODES, ORIENTATION_MODES, POSE_MODELS, VIDEO_EXTENSIONS
 from handloc.progress import format_elapsed
 
 APP_TITLE = "Hand Location Analysis"
-APP_CAPTION = "Nine-sector hand location annotation for frontal conversation videos (Choi et al., 2014, Fig. 3)"
+APP_CAPTION = "Nine-sector hand location annotation for conversation videos (Choi et al., 2014, Fig. 3)"
 TRACKER_KEYS = ["track_high_thresh", "track_low_thresh", "new_track_thresh", "track_buffer", "match_thresh"]
-SECTOR_DIAGRAM = """
+SECTOR_DIAGRAMS = {
+    "frontal": """
 | | person's right | center | person's left |
 |---|:---:|:---:|:---:|
 | above shoulders | 1 | 2 | 3 |
 | shoulders–hips | 4 | **5** (torso) | 6 |
 | below hips | 7 | 8 | 9 |
-"""
+""",
+    "side": """
+| | in front of the knees | between body and knees | behind the body |
+|---|:---:|:---:|:---:|
+| above shoulders | 1 | 2 | 3 |
+| shoulders–thighs | 4 | **5** | 6 |
+| below thighs | 7 | 8 | 9 |
+""",
+}
+SECTOR_TEXT = {
+    "frontal": "The central rectangle spans both **shoulder** keypoints horizontally and runs from the shoulder line "
+    "down to the **hip** line. Sectors are numbered from the person's own viewpoint.",
+    "side": "Assumes the person sits upright. The vertical lines are the **body** (mean of shoulder and hip x) and the "
+    "**knees**; the horizontal lines are the **shoulders** and the **thighs** (mean of hip and knee y). Sectors 1/4/7 "
+    "are always in front of the person.",
+}
 
 
 def terminate_current_process() -> None:
@@ -136,6 +152,14 @@ def render_start(analyzer: HandLocationAnalyzer) -> None:
         output_name = st.text_input("Output folder name", value=default_output.name).strip() or default_output.name
         output_dir = output_parent / output_name
 
+    mode = st.radio(
+        "Mode",
+        MODES,
+        index=MODES.index(ss.get("mode", DEFAULT_MODE)),
+        format_func=lambda value: {"frontal": "Frontal (camera facing the person)", "side": "Side (camera at the person's side)"}[value],
+        horizontal=True,
+    )
+
     device_options = analyzer.device_options
     saved_device = ss.get("device", device_options[0])
     device = st.selectbox(
@@ -156,13 +180,12 @@ def render_start(analyzer: HandLocationAnalyzer) -> None:
         st.caption(f"Output directory: `{output_dir}`")
 
     with st.expander("Sector definition", expanded=False):
-        st.markdown(
-            "The torso rectangle spans both **shoulder** keypoints horizontally and runs from the shoulder line "
-            "down to the **hip** line. Its extended edges split the space into nine sectors, numbered from the "
-            "person's own viewpoint. Each hand's location is the sector containing its **wrist** keypoint."
+        st.markdown(SECTOR_TEXT[mode] + " Each hand's location is the sector containing its **wrist** keypoint.")
+        st.markdown(SECTOR_DIAGRAMS[mode])
+        st.caption(
+            "The person's keypoints are first interpolated over the whole video. With a keypoint threshold above 0, "
+            "a hand is then left out in frames where its wrist or any keypoint used for the grid is below the threshold."
         )
-        st.markdown(SECTOR_DIAGRAM)
-        st.caption("When hips are hidden (e.g. behind a table), the hip line is estimated from the shoulder width (dashed line in the video).")
 
     with st.expander("Detailed Settings", expanded=False):
         detection_tab, location_tab, tracker_tab, output_tab = st.tabs(["Detection", "Location", "Tracking", "Output"])
@@ -178,9 +201,10 @@ def render_start(analyzer: HandLocationAnalyzer) -> None:
                 "Keypoint threshold",
                 0.0,
                 1.0,
-                float(ss.get("keypoint_conf_thresh", 0.5)),
+                float(ss.get("keypoint_conf_thresh", 0.0)),
                 0.05,
-                help="Keypoints below this confidence are treated as missing.",
+                help="0 uses every frame. Otherwise a hand is left out in frames where its wrist or any shoulder/hip "
+                "keypoint is below this confidence (after interpolation). Changing it does not rerun YOLO.",
             )
             use_source_fps = st.checkbox("Track every frame (source FPS)", value=bool(ss.get("use_source_fps", True)))
             person_target_fps = None
@@ -190,35 +214,10 @@ def render_start(analyzer: HandLocationAnalyzer) -> None:
                 )
         with location_tab:
             orientation = st.selectbox(
-                "Orientation",
+                "Orientation (frontal mode)",
                 ORIENTATION_MODES,
                 index=ORIENTATION_MODES.index(ss.get("orientation", DEFAULT_ORIENTATION)),
                 help="frontal: the person's right side is the image left. auto: decide it from the shoulder order each frame.",
-            )
-            smoothing_window = st.number_input(
-                "Keypoint smoothing window (frames)", min_value=1, max_value=61, value=int(ss.get("smoothing_window", 5)), step=1
-            )
-            max_gap_seconds = st.number_input(
-                "Max interpolated gap (s)", min_value=0.0, max_value=10.0, value=float(ss.get("max_gap_seconds", 0.5)), step=0.1
-            )
-            min_segment_seconds = st.number_input(
-                "Min segment duration (s)",
-                min_value=0.0,
-                max_value=10.0,
-                value=float(ss.get("min_segment_seconds", 0.2)),
-                step=0.05,
-                help="Shorter location segments are merged into neighbouring segments to suppress flicker at sector borders.",
-            )
-            min_track_seconds = st.number_input(
-                "Min track duration (s)", min_value=0.0, max_value=60.0, value=float(ss.get("min_track_seconds", 1.0)), step=0.5
-            )
-            hip_ratio = st.number_input(
-                "Fallback torso ratio",
-                min_value=0.3,
-                max_value=3.0,
-                value=float(ss.get("hip_ratio", 1.3)),
-                step=0.05,
-                help="(hip height - shoulder height) / shoulder width, used only when a person's hips are never visible.",
             )
         with tracker_tab:
             tracker_defaults = analyzer.config_manager.load_tracker_defaults()
@@ -234,7 +233,7 @@ def render_start(analyzer: HandLocationAnalyzer) -> None:
             reuse_cached_poses = st.checkbox(
                 "Reuse existing poses.csv when available",
                 value=bool(ss.get("reuse_cached_poses", True)),
-                help="Pose tracking is skipped when the input, model, thresholds, FPS, and tracker settings match.",
+                help="YOLO is skipped when summary.json records the same input, model, person threshold, FPS, and tracker settings.",
             )
 
     if st.button("Run", type="primary", disabled=not valid_input):
@@ -246,22 +245,20 @@ def render_start(analyzer: HandLocationAnalyzer) -> None:
         ss.keypoint_conf_thresh = keypoint_conf_thresh
         ss.use_source_fps = use_source_fps
         ss.person_target_fps = person_target_fps
+        ss.mode = mode
         ss.orientation = orientation
-        ss.smoothing_window = int(smoothing_window)
-        ss.max_gap_seconds = float(max_gap_seconds)
-        ss.min_segment_seconds = float(min_segment_seconds)
-        ss.min_track_seconds = float(min_track_seconds)
-        ss.hip_ratio = float(hip_ratio)
         ss.tracker_updates = tracker_updates
         for key, value in tracker_updates.items():
             ss[key] = value
         ss.make_video = make_video
         ss.reuse_cached_poses = reuse_cached_poses
-        ss.state = "processing"
+        ss.state = "tracking"
         st.rerun()
 
 
-def render_processing(analyzer: HandLocationAnalyzer) -> None:
+def render_tracking(analyzer: HandLocationAnalyzer) -> None:
+    """Run YOLO (or reuse poses.csv), then list the tracked persons for selection."""
+
     ss = st.session_state
     progress_bar = st.progress(0, text="Preparing...")
     try:
@@ -274,16 +271,78 @@ def render_processing(analyzer: HandLocationAnalyzer) -> None:
             keypoint_conf_thresh=ss.keypoint_conf_thresh,
             person_target_fps=ss.person_target_fps,
             tracker_updates=ss.tracker_updates,
-            smoothing_window=ss.smoothing_window,
-            max_gap_seconds=ss.max_gap_seconds,
-            min_track_seconds=ss.min_track_seconds,
-            min_segment_seconds=ss.min_segment_seconds,
-            hip_ratio=ss.hip_ratio,
+            mode=ss.mode,
             orientation=ss.orientation,
             make_video=ss.make_video,
             reuse_cached_poses=ss.reuse_cached_poses,
         )
-        ss.results = analyzer.run_all(progress_bar=progress_bar)
+        poses = analyzer.det_poses(progress_bar=progress_bar)
+        progress_bar.progress(1.0, text="Collecting tracked persons...")
+        ss.poses = poses
+        ss.tracks = analyzer.list_tracks(poses)
+        ss.thumbnails = analyzer.track_thumbnails(poses, ss.tracks)
+        ss.error_message = None
+        ss.state = "select"
+    except Exception as error:
+        ss.error_message = f"{type(error).__name__}: {error}"
+        ss.state = "error"
+    st.rerun()
+
+
+def render_select() -> None:
+    """Show every unique tracked person and let the user pick the one target person."""
+
+    ss = st.session_state
+    tracks = ss.tracks
+    st.subheader("Select the target person")
+    if tracks.empty:
+        st.warning("No persons were tracked in this video.")
+        if st.button("Back to settings"):
+            reset_to_start()
+            st.rerun()
+        return
+    st.caption(
+        "Each image is the frame where YOLO was most confident about that person. One person is annotated per run; "
+        "to annotate another person, run again (YOLO is reused when its settings are unchanged)."
+    )
+    columns_per_row = 4
+    for start in range(0, len(tracks), columns_per_row):
+        row = tracks.iloc[start : start + columns_per_row]
+        columns = st.columns(columns_per_row)
+        for column, track in zip(columns, row.itertuples()):
+            with column:
+                thumbnail = ss.thumbnails.get(int(track.track_id))
+                if thumbnail is not None:
+                    st.image(thumbnail, width="stretch")
+                st.markdown(f"**ID {track.track_id}**")
+                st.caption(f"{track.first_time:.1f}-{track.last_time:.1f} s, {track.detected_frames} frames")
+    track_ids = [int(t) for t in tracks["track_id"]]
+    default = int(tracks.loc[tracks["detected_frames"].idxmax(), "track_id"])
+    selected = st.radio(
+        "Target person",
+        track_ids,
+        index=track_ids.index(default),
+        format_func=lambda track_id: f"ID {track_id}",
+        horizontal=True,
+        key="target_track_id",
+    )
+    col_run, col_back = st.columns([1, 1])
+    with col_run:
+        if st.button("Annotate this person", type="primary", width="stretch"):
+            ss.selected_track_id = int(selected)
+            ss.state = "annotating"
+            st.rerun()
+    with col_back:
+        if st.button("Back to settings", width="stretch"):
+            reset_to_start()
+            st.rerun()
+
+
+def render_annotating(analyzer: HandLocationAnalyzer) -> None:
+    ss = st.session_state
+    progress_bar = st.progress(0, text="Preparing...")
+    try:
+        ss.results = analyzer.annotate(ss.poses, ss.selected_track_id, progress_bar=progress_bar)
         ss.error_message = None
         ss.state = "end"
     except Exception as error:
@@ -309,9 +368,11 @@ def render_end() -> None:
     results = ss.results or {}
     elapsed = results.get("elapsed_seconds")
     st.success("Completed" if elapsed is None else f"Completed in {format_elapsed(float(elapsed))}")
-    st.write(f"Hand location CSV: `{results.get('segments_path')}`")
-    st.write(f"Per-frame CSV: `{results.get('frames_path')}`")
-    st.write(f"Pose CSV: `{results.get('poses_path')}`")
+    st.caption(f"Annotated person: ID {results.get('track_id')}")
+    st.write(f"Locations: `{results.get('locations_path')}`")
+    st.write(f"Normalized wrist coordinates: `{results.get('frames_path')}`")
+    st.write(f"Raw YOLO poses: `{results.get('poses_path')}`")
+    st.write(f"Summary: `{results.get('summary_path')}`")
     video_path = results.get("video_path")
     if video_path is not None:
         st.write(f"Annotated video: `{video_path}`")
@@ -320,7 +381,7 @@ def render_end() -> None:
     st.subheader("Seconds per sector")
     table = location_summary_table(summary)
     if table.empty:
-        st.warning("No persons with usable keypoints were found.")
+        st.warning("No persons were tracked.")
     else:
         st.dataframe(table, hide_index=True, width="stretch")
 
@@ -329,11 +390,18 @@ def render_end() -> None:
         with st.expander(f"Segments ({len(segments)})", expanded=False):
             st.dataframe(segments, hide_index=True, width="stretch")
             st.download_button(
-                "Download hand_locations.csv",
+                "Download locations.csv",
                 segments.to_csv(index=False).encode("utf-8"),
-                file_name="hand_locations.csv",
+                file_name="locations.csv",
                 mime="text/csv",
             )
+
+    heatmap_paths = results.get("heatmap_paths") or {}
+    if heatmap_paths:
+        st.subheader("Wrist heatmaps")
+        for name, path in heatmap_paths.items():
+            st.caption(f"{name}: `{path}`")
+            st.image(str(path), width="stretch")
 
     if video_path is not None and Path(video_path).exists():
         with st.expander("Annotated video", expanded=False):
@@ -353,8 +421,12 @@ def main() -> None:
     state = st.session_state.state
     if state == "start":
         render_start(analyzer)
-    elif state == "processing":
-        render_processing(analyzer)
+    elif state == "tracking":
+        render_tracking(analyzer)
+    elif state == "select":
+        render_select()
+    elif state == "annotating":
+        render_annotating(analyzer)
     elif state == "error":
         st.error(st.session_state.error_message or "Unknown error")
         if st.button("Back"):

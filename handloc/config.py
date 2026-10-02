@@ -5,7 +5,7 @@ from typing import Any
 import cv2
 import yaml
 
-from .constants import ORIENTATION_MODES, POSE_MODELS, VIDEO_EXTENSIONS
+from .constants import MODES, ORIENTATION_MODES, POSE_MODELS, VIDEO_EXTENSIONS
 from .types import AppPaths, MediaContext, PipelineConfig
 
 
@@ -51,11 +51,7 @@ class ConfigManager:
         keypoint_conf_thresh: float,
         person_target_fps: float | None,
         tracker_updates: dict[str, Any] | None,
-        smoothing_window: int,
-        max_gap_seconds: float,
-        min_track_seconds: float,
-        min_segment_seconds: float,
-        hip_ratio: float,
+        mode: str,
         orientation: str,
         make_video: bool,
         reuse_cached_poses: bool,
@@ -67,6 +63,8 @@ class ConfigManager:
             raise ValueError(f"Unsupported input type for {media_path}. Supported: {', '.join(sorted(VIDEO_EXTENSIONS))}")
         if pose_model not in POSE_MODELS:
             raise ValueError(f"pose_model must be one of {POSE_MODELS}")
+        if mode not in MODES:
+            raise ValueError(f"mode must be one of {MODES}")
         if orientation not in ORIENTATION_MODES:
             raise ValueError(f"orientation must be one of {ORIENTATION_MODES}")
         if not 0.0 <= person_det_thresh <= 1.0:
@@ -75,12 +73,6 @@ class ConfigManager:
             raise ValueError("keypoint_conf_thresh must be between 0.0 and 1.0")
         if person_target_fps is not None and person_target_fps < 0:
             raise ValueError("person_target_fps must be greater than or equal to 0")
-        if smoothing_window < 1:
-            raise ValueError("smoothing_window must be at least 1")
-        if max_gap_seconds < 0 or min_track_seconds < 0 or min_segment_seconds < 0:
-            raise ValueError("max_gap_seconds, min_track_seconds, and min_segment_seconds must be >= 0")
-        if hip_ratio <= 0:
-            raise ValueError("hip_ratio must be greater than 0")
 
         return PipelineConfig(
             media_path=media_path,
@@ -91,11 +83,7 @@ class ConfigManager:
             keypoint_conf_thresh=float(keypoint_conf_thresh),
             person_target_fps=float(person_target_fps or 0.0),
             tracker_updates=dict(tracker_updates or {}),
-            smoothing_window=int(smoothing_window),
-            max_gap_seconds=float(max_gap_seconds),
-            min_track_seconds=float(min_track_seconds),
-            min_segment_seconds=float(min_segment_seconds),
-            hip_ratio=float(hip_ratio),
+            mode=mode,
             orientation=orientation,
             make_video=bool(make_video),
             reuse_cached_poses=bool(reuse_cached_poses),
@@ -125,11 +113,13 @@ class ConfigManager:
             raise FileNotFoundError(f"Could not open video: {config.media_path}")
         try:
             fps = float(capture.get(cv2.CAP_PROP_FPS))
-            total_frames = int(round(float(capture.get(cv2.CAP_PROP_FRAME_COUNT))))
             width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
         finally:
             capture.release()
+        # Tracks are filled over the whole video, so count the frames that can actually be decoded instead
+        # of trusting CAP_PROP_FRAME_COUNT, which can be wrong (e.g. 251 reported, 237 readable).
+        total_frames = self.count_readable_frames(config.media_path)
         if fps <= 0 or total_frames <= 0:
             raise RuntimeError(f"Invalid video metadata for {config.media_path}")
 
@@ -140,10 +130,9 @@ class ConfigManager:
             media_path=config.media_path,
             output_dir=output_dir,
             poses_path=output_dir / "poses.csv",
-            poses_meta_path=output_dir / ".poses_meta.json",
             frames_path=output_dir / "frames.csv",
-            segments_path=output_dir / "hand_locations.csv",
-            video_path=output_dir / "hand_locations.mp4",
+            locations_path=output_dir / "locations.csv",
+            video_path=output_dir / "locations.mp4",
             summary_path=output_dir / "summary.json",
             fps=fps,
             total_frames=total_frames,
@@ -151,3 +140,16 @@ class ConfigManager:
             height=height,
             person_stride=person_stride,
         )
+
+    @staticmethod
+    def count_readable_frames(media_path: Path) -> int:
+        capture = cv2.VideoCapture(str(media_path))
+        if not capture.isOpened():
+            raise FileNotFoundError(f"Could not open video: {media_path}")
+        total = 0
+        try:
+            while capture.grab():
+                total += 1
+        finally:
+            capture.release()
+        return total
